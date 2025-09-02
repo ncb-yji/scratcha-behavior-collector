@@ -422,11 +422,11 @@ function App() {
           onError={handleError}
         />
       </div>
-      {finished && (
-        <div className="retry-bar" style={{ marginTop: 12 }}>
-          <button data-role="refresh-button" onClick={resetSession}>다시 풀기</button>
-        </div>
-      )}
+      {/* {finished && ( */}
+        {/* <div className="retry-bar" style={{ marginTop: 12 }}> */}
+          {/* <button data-role="refresh-button" onClick={resetSession}>다시 풀기</button> */}
+        {/* </div> */}
+      {/* )} */}
     </>
   )
 }
