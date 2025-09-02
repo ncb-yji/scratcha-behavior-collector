@@ -29,3 +29,4 @@ replays/
 *.mp4
 *.gif
 *.png
+./env
