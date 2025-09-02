@@ -1,0 +1,31 @@
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Python backend
+backend/venv/
+backend/.env
+backend/.env.*
+__pycache__/
+*.pyc
+*.pyo
+*.log
+
+# Node frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.*
+npm-debug.log*
+yarn*.log
+
+# Data & outputs (수집물/결과물 실수 커밋 방지)
+*.json.gz
+data/
+out/
+replays/
+*.mp4
+*.gif
+*.png
