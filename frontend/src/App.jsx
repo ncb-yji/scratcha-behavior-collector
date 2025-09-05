@@ -395,26 +395,36 @@ function App() {
 
     const onBeforeUnload = () => {
       try {
-        // 남은 버퍼를 비우되, 언로드 전송은 ‘작게’
-        stopMoveTimer(); stopFreeMoveTimer(); flushMoves(); flushFreeMoves();
+        // 진행 중인 버퍼/타이머를 마무리
+        stopMoveTimer(); 
+        stopFreeMoveTimer();
+        flushMoves(); 
+        flushFreeMoves();
+
+        // 최신 ROI/메타와 이벤트 수집
         const roiMap = buildRoiMap();
         const metaFull = buildMeta(sessionId, roiMap);
-        // 언로드에선 큰 move 배열은 생략/축약: 서버가 label/meta만 받아도 OK하게
-        const minimal = pruneForUpload({ meta: metaFull, events: [], label: undefined });
+        const fullPayload = { meta: metaFull, events: eventsRef.current, label: undefined };
+        const payload = pruneForUpload(fullPayload);
+
+        // 언로드 시점에는 sendBeacon이 가장 안정적
         if (navigator.sendBeacon) {
-          const blob = new Blob([JSON.stringify(minimal)], { type: 'application/json' });
+          const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
           navigator.sendBeacon(`${API_URL}/collect`, blob);
         } else {
+          // 폴백: 실패해도 무시
           fetch(`${API_URL}/collect`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(minimal),
+            body: JSON.stringify(payload),
             keepalive: true,
           }).catch(() => {});
         }
-      } catch {}
-    }
-    window.addEventListener('beforeunload', onBeforeUnload)
+      } catch {
+        // 언로드 시점 에러는 로깅 생략/무시
+      }
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
 
     return () => {
       rootEl.removeEventListener?.('click', onClick, optCap)
