@@ -393,38 +393,8 @@ function App() {
     })
     mo.observe(document, { childList: true, subtree: true, attributes: true })
 
-  const onBeforeUnload = () => {
-    try {
-      // 진행 중인 버퍼/타이머를 마무리
-      stopMoveTimer(); 
-      stopFreeMoveTimer();
-      flushMoves(); 
-      flushFreeMoves();
-
-      // 최신 ROI/메타와 이벤트 수집
-      const roiMap = buildRoiMap();
-      const metaFull = buildMeta(sessionId, roiMap);
-      const fullPayload = { meta: metaFull, events: eventsRef.current, label: undefined };
-      const payload = pruneForUpload(fullPayload);
-
-      // 언로드 시점에는 sendBeacon이 가장 안정적
-      if (navigator.sendBeacon) {
-        const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
-        navigator.sendBeacon(`${API_URL}/collect`, blob);
-      } else {
-        // 폴백: 실패해도 무시
-        fetch(`${API_URL}/collect`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-          keepalive: true,
-        }).catch(() => {});
-      }
-    } catch {
-      // 언로드 시점 에러는 로깅 생략/무시
-    }
-  };
-  window.addEventListener('beforeunload', onBeforeUnload);
+    const onBeforeUnload = () => postCollect(undefined)
+    window.addEventListener('beforeunload', onBeforeUnload)
 
     return () => {
       rootEl.removeEventListener?.('click', onClick, optCap)
