@@ -393,8 +393,7 @@ function App() {
     })
     mo.observe(document, { childList: true, subtree: true, attributes: true })
 
-    const onBeforeUnload = () => postCollect(undefined)
-    window.addEventListener('beforeunload', onBeforeUnload)
+    // ⚠️ beforeunload 업로드 제거 (중복 저장 방지)
 
     return () => {
       rootEl.removeEventListener?.('click', onClick, optCap)
@@ -404,7 +403,7 @@ function App() {
       window.removeEventListener('pointerup', onPointerUp, optWin)
       window.removeEventListener('pointercancel', onPointerCancel, optWin)
 
-      window.removeEventListener('beforeunload', onBeforeUnload)
+      // beforeunload 리스너 제거 코드도 삭제
       mo.disconnect()
       stopMoveTimer(); stopFreeMoveTimer()
     }
