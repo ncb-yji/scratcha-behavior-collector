@@ -20,13 +20,20 @@ const SCRATCHA_ENDPOINT = import.meta.env.VITE_SCRATCHA_ENDPOINT ?? 'https://api
 const MOVE_FLUSH_MS = 50
 const FREE_FLUSH_MS = 120
 
-// ---------- Shadow DOM 호환 유틸 ----------
+// ---- 업로드 한도/유틸 (다운샘플링 없이, 큰 페이로드는 조각 전송) ----
+const MAX_SINGLE_UPLOAD_BYTES = 900_000;     // 이 크기 이하면 /collect 단일 업로드
+const TARGET_CHUNK_BYTES      = 300_000;     // 조각 하나 목표 크기(대략값)
+const FETCH_TIMEOUT_MS        = 20_000;
+
+function estimateBytes(obj) {
+  try { return new TextEncoder().encode(JSON.stringify(obj)).length } catch { return (JSON.stringify(obj)||'').length }
+}
 function* walkDeep(root) {
   const stack = [root]
   while (stack.length) {
     const node = stack.pop()
     if (!node) continue
-    if (node.nodeType === 1) { // Element
+    if (node.nodeType === 1) {
       yield node
       const children = node.children || []
       for (let i = children.length - 1; i >= 0; i--) stack.push(children[i])
@@ -38,7 +45,6 @@ function* walkDeep(root) {
     }
   }
 }
-
 function getElByRole(role) {
   for (const el of walkDeep(document)) {
     if (el?.matches && el.matches(`[data-role="${role}"]`)) return el
@@ -68,13 +74,14 @@ function getRoleAtPoint(x, y) {
 }
 
 // ---- ROI 유틸 ----
-function getRectPx(el) {
+function rectOfRole(role) {
+  const el = document.querySelector(`[data-role="${role}"]`)
   if (!el) return null
   const r = el.getBoundingClientRect()
   return { left: r.left, top: r.top, w: r.width, h: r.height }
 }
 
-// 업로드 직전 슬림 스키마
+// 업로드 직전 슬림 스키마(원본 값 보존, 구조만 슬림화)
 function pruneForUpload(fullPayload) {
   const meta = fullPayload?.meta || {};
   const evs = Array.isArray(fullPayload?.events) ? fullPayload.events : [];
@@ -133,20 +140,7 @@ function pruneForUpload(fullPayload) {
   return { meta: metaSlim, events: slimEvents, label }
 }
 
-function rectOfRole(role) {
-  const el = document.querySelector(`[data-role="${role}"]`)
-  if (!el) return null
-  const r = el.getBoundingClientRect()
-  return { left: r.left, top: r.top, w: r.width, h: r.height }
-}
-
-const ROI_FALLBACK_FRAC = {
-  'instruction-area': { x: 0.05, y: 0.02, w: 0.90, h: 0.10 },
-  'canvas-container': { x: 0.05, y: 0.14, w: 0.90, h: 0.48 },
-  'answers-area': { x: 0.05, y: 0.66, w: 0.90, h: 0.28 },
-  'refresh-button': { x: 0.90, y: 0.02, w: 0.08, h: 0.08 },
-}
-
+// ---- 클릭 시 업로드(단일 or 조각) ----
 function App() {
   const [runKey, setRunKey] = useState(0)
   const [finished, setFinished] = useState(false)
@@ -256,6 +250,48 @@ function App() {
     freeBufRef.current = []
   }
 
+  // ---- 조각 업로드 보조 함수 ----
+  async function fetchJSON(url, body, { timeoutMs = FETCH_TIMEOUT_MS } = {}) {
+    const ac = new AbortController()
+    const timer = setTimeout(() => ac.abort('timeout'), timeoutMs)
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        keepalive: false,
+        signal: ac.signal,
+      })
+      clearTimeout(timer)
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '')
+        throw new Error(`HTTP ${res.status} ${txt}`)
+      }
+      return await res.json().catch(() => ({}))
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  function sliceEventsByBytes(meta, events, targetBytes) {
+    // meta는 첫 조각에만 포함, 이후 조각은 meta: {session_id} 만 최소 포함
+    const chunks = []
+    let cur = []
+    let curBytes = estimateBytes({ meta, events: [] })
+    for (const ev of events) {
+      const addBytes = estimateBytes(ev)
+      if (cur.length > 0 && (curBytes + addBytes) > targetBytes) {
+        chunks.push(cur)
+        cur = []
+        curBytes = estimateBytes({ meta: { session_id: meta.session_id }, events: [] })
+      }
+      cur.push(ev)
+      curBytes += addBytes
+    }
+    if (cur.length) chunks.push(cur)
+    return chunks
+  }
+
   const postCollect = async (label) => {
     if (sentRef.current) return
     try {
@@ -264,17 +300,36 @@ function App() {
       const roiMap = buildRoiMap()
       const metaFull = buildMeta(sessionId, roiMap)
       const fullPayload = { meta: metaFull, events: eventsRef.current, label }
-      const payload = pruneForUpload(fullPayload)
-      const res = await fetch(`${API_URL}/collect`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        keepalive: true,
-      })
-      if (!res.ok) {
-        console.warn('collect failed:', res.status, await res.text().catch(() => ''))
-        return
+      const slim = pruneForUpload(fullPayload) // 구조만 슬림화(원본 값 유지)
+
+      // 1) 작은 페이로드면 기존 /collect 한 번 호출 (원래 코드 흐름):contentReference[oaicite:1]{index=1}
+      const singleBytes = estimateBytes({ meta: slim.meta, events: slim.events, label: slim.label })
+      if (singleBytes <= MAX_SINGLE_UPLOAD_BYTES) {
+        await fetchJSON(`${API_URL}/collect`, { meta: slim.meta, events: slim.events, label: slim.label })
+      } else {
+        // 2) 큰 페이로드면 조각 업로드 → 최종 한 번만 파일 생성
+        const { meta, events } = slim
+        const chunks = sliceEventsByBytes(meta, events, TARGET_CHUNK_BYTES)
+        // 첫 조각에는 full meta, 이후에는 최소 meta(session_id)만
+        for (let i = 0; i < chunks.length; i++) {
+          const isFirst = (i === 0)
+          const partMeta = isFirst ? meta : { session_id: meta.session_id }
+          await fetchJSON(`${API_URL}/collect_chunk`, {
+            meta: partMeta,
+            events: chunks[i],
+            label: null,
+            part_index: i,
+            total_parts: chunks.length,
+          })
+        }
+        // 마지막에 한 번만 finalize: label 포함, 서버에서 단일 파일 업로드:contentReference[oaicite:2]{index=2}
+        await fetchJSON(`${API_URL}/collect_finalize`, {
+          meta: { session_id: meta.session_id },
+          events: [],   // 이벤트는 이미 조각으로 보냄
+          label: slim.label ?? label ?? undefined,
+        })
       }
+
       sentRef.current = true
       eventsRef.current = []
       moveBufRef.current = []
@@ -306,6 +361,20 @@ function App() {
     postCollect({ passed: 0, error: msg }).finally(() => setFinished(true))
   }
 
+  function toNorm(clientX, clientY) {
+    const el = canvasRef.current || getElByRole('canvas-container') || hostRef.current
+    if (!el) return null
+    const r = el.getBoundingClientRect()
+    const x_raw = clientX, y_raw = clientY
+    const xr = (x_raw - r.left) / Math.max(1, r.width)
+    const yr = (y_raw - r.top) / Math.max(1, r.height)
+    const oob = (xr < 0 || xr > 1 || yr < 0 || yr > 1) ? 1 : 0
+    const x = Math.min(1, Math.max(0, xr))
+    const y = Math.min(1, Math.max(0, yr))
+    const on_canvas = oob ? 0 : 1
+    return { x, y, x_raw, y_raw, on_canvas, oob }
+  }
+
   function onPointerDown(e) {
     deviceRef.current = String(e.pointerType || 'unknown')
     const n = toNorm(e.clientX, e.clientY)
@@ -313,7 +382,6 @@ function App() {
     const t = nowMs()
     isDraggingRef.current = true
     startMoveTimer()
-    // FREE 버퍼 클리어 → DRAG 중간에 섞이지 않도록
     moveBufRef.current = []
     freeBufRef.current = []
     eventsRef.current.push({ t: Math.round(t - t0Ref.current), type: 'pointerdown', x_raw: n.x_raw, y_raw: n.y_raw })
@@ -341,7 +409,6 @@ function App() {
     isDraggingRef.current = false
     stopMoveTimer()
     flushMoves()
-    // FREE 버퍼 초기화 → DRAG 뒤에 FREE가 붙는 것 방지
     freeBufRef.current = []
     eventsRef.current.push({ t: Math.round(t - t0Ref.current), type: 'pointerup', x_raw: n.x_raw, y_raw: n.y_raw })
   }
@@ -373,17 +440,14 @@ function App() {
     const rootEl = hostRef.current || document
     const optCap = { capture: true, passive: true }
 
-    // ✅ click은 root에서
     rootEl.addEventListener?.('click', onClick, optCap)
 
-    // ✅ pointerdown은 window에서 (위젯 밖에서도 DOWN 수집)
     const optWin = { passive: true, capture: true }
     window.addEventListener('pointerdown', onPointerDown, optWin)
     window.addEventListener('pointermove', onPointerMove, optWin)
     window.addEventListener('pointerup', onPointerUp, optWin)
     window.addEventListener('pointercancel', onPointerCancel, optWin)
 
-    // canvas-container 갱신 감지
     const mo = new MutationObserver(() => {
       const latest = getElByRole('canvas-container')
       if (latest && latest !== canvasRef.current) {
@@ -393,17 +457,12 @@ function App() {
     })
     mo.observe(document, { childList: true, subtree: true, attributes: true })
 
-    // ⚠️ beforeunload 업로드 제거 (중복 저장 방지)
-
     return () => {
       rootEl.removeEventListener?.('click', onClick, optCap)
-
       window.removeEventListener('pointerdown', onPointerDown, optWin)
       window.removeEventListener('pointermove', onPointerMove, optWin)
       window.removeEventListener('pointerup', onPointerUp, optWin)
       window.removeEventListener('pointercancel', onPointerCancel, optWin)
-
-      // beforeunload 리스너 제거 코드도 삭제
       mo.disconnect()
       stopMoveTimer(); stopFreeMoveTimer()
     }
@@ -421,11 +480,6 @@ function App() {
           onError={handleError}
         />
       </div>
-      {/* {finished && ( */}
-        {/* <div className="retry-bar" style={{ marginTop: 12 }}> */}
-          {/* <button data-role="refresh-button" onClick={resetSession}>다시 풀기</button> */}
-        {/* </div> */}
-      {/* )} */}
     </>
   )
 }
